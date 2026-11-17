@@ -1,0 +1,51 @@
+# Build the Famous Beats Vocal Presets plugin on a Mac in the cloud.
+# Push this project to GitHub and this workflow builds the .vst3 and
+# .component files for you — no Xcode needed on your own Mac.
+name: Build macOS plugin
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: # lets you press "Run workflow" by hand in the Actions tab
+
+jobs:
+  build-macos:
+    # macos-14 was retired by GitHub on Nov 2, 2026 — a workflow asking
+    # for it fails immediately with "The configuration
+    # 'macos-14-arm64-us-default' is not supported". macos-15 is current.
+    runs-on: macos-15
+
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.28.x"
+
+      - name: Configure
+        # The arch and deployment target MUST be passed on the command
+        # line. Setting them inside CMakeLists.txt after project() is
+        # ignored by the Xcode generator and the first Vocal Cleaner
+        # build came out arm64-only because of that.
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Find the built plugins
+        run: |
+          echo "=== VST3 ==="
+          find build -name "*.vst3" -maxdepth 6
+          echo "=== AU ==="
+          find build -name "*.component" -maxdepth 6
+
+      - name: Upload the plugins
+        uses: actions/upload-artifact@v4
+        with:
+          name: FamousBeatsVocalPresets-macOS
+          path: |
+            build/FamousBeatsVocalPresets_artefacts/Release/VST3/*.vst3
+            build/FamousBeatsVocalPresets_artefacts/Release/AU/*.component
+          if-no-files-found: error
