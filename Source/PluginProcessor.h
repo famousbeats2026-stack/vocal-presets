@@ -18,8 +18,8 @@ extern "C" {
 //==============================================================================
 // Famous Beats Vocal Presets — a one-click vocal chain in a single plugin:
 //
-//   Vocal Cleaner (RNNoise) -> EQ -> Compressor -> Saturation -> Tune
-//   (pitch correction) -> Reverb -> Delay -> Output Gain
+//   Preamp (Avalon-style) -> Vocal Cleaner (RNNoise) -> EQ -> Compressor
+//   -> Saturation -> Tune (pitch correction) -> Reverb -> Delay -> Output
 //
 // Four artist presets (Drake / Travis Scott / Don Toliver / Clean) set
 // every section at once; each section still has its own knobs to tweak.
@@ -59,7 +59,8 @@ public:
     juce::AudioProcessorValueTreeState& getParametersState() { return parameters; }
 
     // One-click presets. Sets every section's parameters.
-    // 0 = Drake, 1 = Travis Scott, 2 = Don Toliver, 3 = Clean / Radio
+    // 0 = Drake, 1 = Travis Scott, 2 = Don Toliver, 3 = Clean / Radio,
+    // 4 = Rap Singing
     void applyPreset(int presetIndex);
     static const char* getPresetName(int presetIndex);
     int getCurrentPreset() const { return currentPreset; }
@@ -68,10 +69,29 @@ public:
     float getDetectedPitchHz() const { return detectedPitchHz.load(); }
     float getCurrentShiftRatio() const { return shiftRatioSmoothed.load(); }
 
+    // Effective delay time in seconds (tempo-synced divisions when Sync
+    // is on, otherwise the ms control). Uses the host BPM when the
+    // playhead provides one, else the manual BPM parameter.
+    double getDelayTimeSeconds() const;
+    // Beats per delay division index (0 = 1/2 ... 6 = 1/64).
+    static double divisionToBeats(int divisionIndex);
+    // Combined EQ magnitude response in dB at a frequency, computed
+    // from the current EQ parameters (drives the editor's EQ curve).
+    float getEqResponseDb(float freqHz) const;
+    // Same, for many frequencies at once (coefficients computed once).
+    void getEqResponseCurve(const float* freqs, float* dbs, int numPoints) const;
+    // Current host tempo in BPM, or 0 when the host provides none.
+    double getHostBpm() const { return hostBpm.load(); }
+
     // ---- Parameter IDs ----
     static constexpr const char* kBypassParam    = "bypass";
     static constexpr const char* kInputGainParam = "inputGain";   // dB
     static constexpr const char* kOutputGainParam = "outputGain"; // dB
+
+    // Preamp (Avalon-style): warm tube-style gain stage at the front.
+    static constexpr const char* kPreampGainParam  = "preampGain";  // dB, -12..+24
+    static constexpr const char* kPreampDriveParam = "preampDrive"; // 0..100 %
+    static constexpr const char* kPreampAirParam   = "preampAir";   // bool, Air button
 
     static constexpr const char* kCleanAmountParam = "cleanAmount"; // 0..100 %
 
@@ -100,12 +120,22 @@ public:
 
     static constexpr const char* kReverbMixParam  = "reverbMix";  // 0..100 %
     static constexpr const char* kReverbSizeParam = "reverbSize"; // 0..100 %
+    static constexpr const char* kReverbTypeParam = "reverbType"; // 0..3 (Hall/Plate/Room/Chamber)
 
     static constexpr const char* kDelayTimeParam     = "delayTime";     // ms
     static constexpr const char* kDelayFeedbackParam = "delayFeedback"; // 0..85 %
     static constexpr const char* kDelayMixParam      = "delayMix";      // 0..100 %
+    static constexpr const char* kDelaySyncParam     = "delaySync";     // bool, tempo sync
+    static constexpr const char* kDelayDivisionParam = "delayDivision"; // 0..6 (1/2..1/64)
+    static constexpr const char* kDelayBpmParam      = "delayBpm";      // manual BPM, 40..240
 
-    static constexpr int kNumPresets = 4;
+    static constexpr int kNumPresets = 5;
+    static constexpr const char* kReverbTypeNames[4] = {
+        "Hall", "Plate", "Room", "Chamber"
+    };
+    static constexpr const char* kDelayDivisionNames[7] = {
+        "1/2", "1/4", "1/8", "1/12", "1/16", "1/32", "1/64"
+    };
     static constexpr const char* kScaleNames[5] = {
         "Major", "Minor", "Major Pent", "Minor Pent", "Chromatic"
     };
@@ -162,7 +192,10 @@ private:
     struct PhaseVocoder
     {
         static constexpr int kFftSize = 2048;
-        static constexpr int kHop = 512;
+        static constexpr int kHop = 1024; // 50% overlap: half the FFT
+        // rate of the old 512 hop, same 2048-sample latency. Hann^2
+        // overlap-add sums to 1.0 at 50% overlap (2.0 at 75%), so the
+        // synthesis needs kSynthScale = 2.0 to stay unity gain.
         static constexpr int kNumBins = kFftSize / 2 + 1;
 
         void prepare(double sampleRate);
@@ -198,6 +231,7 @@ private:
     float quantiseToScale(float freqHz, int key, int scale) const;
 
     // ---- Chain stages ----
+    void processPreamp(juce::AudioBuffer<float>& buffer);
     void processCleaner(juce::AudioBuffer<float>& buffer, float amount);
     void processEQ(juce::AudioBuffer<float>& buffer);
     void processCompressor(juce::AudioBuffer<float>& buffer);
@@ -205,6 +239,10 @@ private:
     void processTuner(juce::AudioBuffer<float>& buffer);
     void processReverb(juce::AudioBuffer<float>& buffer);
     void processDelay(juce::AudioBuffer<float>& buffer);
+
+    // Tuner dry-delay only (no STFT): keeps the reported latency true
+    // when the tuner is bypassed, at the cost of a ring-buffer copy.
+    void processTunerDryDelayOnly(juce::AudioBuffer<float>& buffer);
 
     void setParamValue(const char* paramId, float value);
 
@@ -215,6 +253,9 @@ private:
     std::atomic<float>* bypassParam = nullptr;
     std::atomic<float>* inputGainParam = nullptr;
     std::atomic<float>* outputGainParam = nullptr;
+    std::atomic<float>* preampGainParam = nullptr;
+    std::atomic<float>* preampDriveParam = nullptr;
+    std::atomic<float>* preampAirParam = nullptr;
     std::atomic<float>* cleanAmountParam = nullptr;
     std::atomic<float>* eqAmountParam = nullptr;
     std::atomic<float>* hpFreqParam = nullptr;
@@ -237,9 +278,24 @@ private:
     std::atomic<float>* tuneScaleParam = nullptr;
     std::atomic<float>* reverbMixParam = nullptr;
     std::atomic<float>* reverbSizeParam = nullptr;
+    std::atomic<float>* reverbTypeParam = nullptr;
     std::atomic<float>* delayTimeParam = nullptr;
     std::atomic<float>* delayFeedbackParam = nullptr;
     std::atomic<float>* delayMixParam = nullptr;
+    std::atomic<float>* delaySyncParam = nullptr;
+    std::atomic<float>* delayDivisionParam = nullptr;
+    std::atomic<float>* delayBpmParam = nullptr;
+
+    // Host tempo (BPM) from the playhead, 0 when the host gives none.
+    std::atomic<double> hostBpm { 0.0 };
+
+    // Preamp (Avalon-style): one Air high-shelf per channel.
+    struct PreampChannel
+    {
+        juce::dsp::IIR::Filter<float> airShelf;
+        bool airOn = false;
+    };
+    std::vector<std::unique_ptr<PreampChannel>> preampChannels;
 
     // Cleaner state.
     std::vector<CleanerChannelState> cleanerChannels;
