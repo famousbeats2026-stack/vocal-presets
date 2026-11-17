@@ -6,7 +6,13 @@
 //   3. Vocal-like signal through the Clean/Radio preset (level/NaN)
 //   4. Silence (no output, no crash, no NaN)
 //   5. Polyphonic input with the tuner on (no crash, no NaN)
-//   6. All four presets on a vocal-like signal (no NaN, no clipping)
+//   6. All five presets on a vocal-like signal (no NaN, no clipping)
+//   7. Preamp: gain raises level without clipping, AIR lifts the top
+//      end, full drive does not clip
+//   8. Reverb types: each type produces a tail, tails differ
+//   9. Delay divisions: computed ms at 120 BPM, plus an impulse echo
+//  10. EQ curve: response follows the parameters
+//  11. CPU measurement (informational, never fails) + per-section profile
 //
 // Usage: vocal_presets_test
 // Exit code 0 = all tests passed, 1 = any test failed.
@@ -14,6 +20,7 @@
 #include "../Source/PluginProcessor.h"
 #include <cstdio>
 #include <cmath>
+#include <chrono>
 #include <vector>
 #include <functional>
 #include <random>
@@ -280,11 +287,11 @@ int main()
         check(countNan(out) == 0, "no NaN in output");
     }
 
-    // ---- Test 6: all four presets ------------------------------------
+    // ---- Test 6: all five presets ------------------------------------
     {
-        printf("Test 6: all four presets on a vocal-like signal\n");
+        printf("Test 6: all five presets on a vocal-like signal\n");
         double phase = 0.0;
-        for (int p = 0; p < 4; ++p)
+        for (int p = 0; p < FamousBeatsVocalPresetsProcessor::kNumPresets; ++p)
         {
             FamousBeatsVocalPresetsProcessor proc;
             proc.prepareToPlay(kSr, kBlock);
@@ -306,6 +313,301 @@ int main()
                           FamousBeatsVocalPresetsProcessor::getPresetName(p));
             check(peak <= 1.0f && countNan(out) == 0, name);
         }
+    }
+
+    // ---- CPU benchmark ------------------------------------------------
+    // Informational only (never fails): render 10 s of vocal-like audio
+    // through the heaviest preset (Travis Scott: tune 100, sat 100,
+    // reverb 35, delay 30) in 512-sample blocks and report wall time
+    // as a percentage of real-time on one core. Three passes, median.
+    // The signal generator itself is included in the timing in both the
+    // before and after measurements, so the delta is what matters.
+    {
+        printf("\nCPU benchmark: 10 s vocal-like audio, Travis Scott preset\n");
+        double pcts[3] = { 0.0, 0.0, 0.0 };
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            FamousBeatsVocalPresetsProcessor proc;
+            proc.prepareToPlay(kSr, kBlock);
+            proc.applyPreset(1); // Travis Scott — heaviest
+            double phase = 0.0;
+            const auto t0 = std::chrono::steady_clock::now();
+            auto out = render(proc, 10.0, [&](double t, int)
+            {
+                const double f0 = 220.0 * std::pow(2.0, (0.5 / 12.0) * std::sin(2.0 * juce::MathConstants<double>::pi * 5.0 * t));
+                phase += 2.0 * juce::MathConstants<double>::pi * f0 / kSr;
+                double s = 0.0;
+                for (int k = 1; k <= 6; ++k)
+                    s += (1.0 / k) * std::sin(k * phase);
+                return (float)(0.25 * s);
+            });
+            const auto t1 = std::chrono::steady_clock::now();
+            const double secs = std::chrono::duration<double>(t1 - t0).count();
+            pcts[pass] = secs / 10.0 * 100.0;
+            printf("  pass %d: %.2f s wall for 10 s audio = %.1f%% of one core\n",
+                   pass + 1, secs, pcts[pass]);
+            (void)out;
+        }
+        double median = pcts[1];
+        if ((pcts[0] <= pcts[1] && pcts[1] <= pcts[2]) || (pcts[2] <= pcts[1] && pcts[1] <= pcts[0]))
+            median = pcts[1];
+        else if ((pcts[1] <= pcts[0] && pcts[0] <= pcts[2]) || (pcts[2] <= pcts[0] && pcts[0] <= pcts[1]))
+            median = pcts[0];
+        else
+            median = pcts[2];
+        printf("  median: %.1f%% of one core (target < 25%%)\n", median);
+    }
+
+    // ---- Test 7: preamp gain, drive, and AIR -------------------------
+    {
+        printf("\nTest 7: preamp gain / drive / AIR button\n");
+        // 7a: +12 dB gain should raise the level ~4x without clipping.
+        {
+            FamousBeatsVocalPresetsProcessor proc;
+            proc.prepareToPlay(kSr, kBlock);
+            setChainFlat(proc);
+            setParam(proc, FamousBeatsVocalPresetsProcessor::kPreampGainParam, 12.0f);
+            double phase = 0.0;
+            auto out = render(proc, 1.0, [&](double t, int)
+            {
+                const double f0 = 220.0;
+                phase += 2.0 * juce::MathConstants<double>::pi * f0 / kSr;
+                return (float)(0.2 * std::sin(phase));
+            });
+            const double rms = regionRms(out, 0.2, 1.0);
+            const float peak = regionPeak(out, 0.0, 1.0);
+            printf("  +12 dB gain: output RMS %.3f (expect ~0.56), peak %.2f\n", rms, peak);
+            check(rms > 0.45 && rms < 0.65, "preamp +12 dB raises level ~4x");
+            check(peak <= 1.0f, "preamp gain does not clip");
+            check(countNan(out) == 0, "no NaN in output");
+        }
+        // 7b: AIR on should lift the top end measurably. A +4 dB high
+        // shelf only reaches about half its gain AT its corner, so the
+        // probe is at 18 kHz, well above the 14 kHz corner, where the
+        // shelf is at (nearly) full gain.
+        {
+            auto airRms = [&](bool airOn)
+            {
+                FamousBeatsVocalPresetsProcessor proc;
+                proc.prepareToPlay(kSr, kBlock);
+                setChainFlat(proc);
+                setParam(proc, FamousBeatsVocalPresetsProcessor::kPreampAirParam, airOn ? 1.0f : 0.0f);
+                auto out = render(proc, 1.0, [&](double t, int)
+                {
+                    return (float)(0.2 * std::sin(2.0 * juce::MathConstants<double>::pi * 18000.0 * t));
+                });
+                return regionRms(out, 0.2, 1.0);
+            };
+            const double off = airRms(false);
+            const double on = airRms(true);
+            printf("  18 kHz sine RMS: AIR off %.4f, AIR on %.4f (ratio %.2f, expect ~1.58)\n",
+                   off, on, on / off);
+            check(on / off > 1.35 && on / off < 1.75, "AIR button lifts the top end ~+4 dB");
+        }
+        // 7c: full drive on a loud sine must not clip.
+        {
+            FamousBeatsVocalPresetsProcessor proc;
+            proc.prepareToPlay(kSr, kBlock);
+            setChainFlat(proc);
+            setParam(proc, FamousBeatsVocalPresetsProcessor::kPreampDriveParam, 100.0f);
+            auto out = render(proc, 1.0, [&](double t, int)
+            {
+                return (float)(0.5 * std::sin(2.0 * juce::MathConstants<double>::pi * 220.0 * t));
+            });
+            const float peak = regionPeak(out, 0.0, 1.0);
+            printf("  drive 100%% on 0.5 sine: peak %.2f\n", peak);
+            check(peak <= 1.0f, "preamp full drive does not clip");
+            check(countNan(out) == 0, "no NaN in output");
+        }
+    }
+
+    // ---- Test 8: reverb types -----------------------------------------
+    // 1 s of sine, then silence: measure the tail RMS after the input
+    // stops, where only the reverb is audible. Types must differ.
+    {
+        printf("\nTest 8: reverb types (Hall / Plate / Room / Chamber)\n");
+        double rmsByType[4] = { 0, 0, 0, 0 };
+        for (int t = 0; t < 4; ++t)
+        {
+            FamousBeatsVocalPresetsProcessor proc;
+            proc.prepareToPlay(kSr, kBlock);
+            setChainFlat(proc);
+            setParam(proc, FamousBeatsVocalPresetsProcessor::kReverbTypeParam, (float)t);
+            setParam(proc, FamousBeatsVocalPresetsProcessor::kReverbMixParam, 50.0f);
+            setParam(proc, FamousBeatsVocalPresetsProcessor::kReverbSizeParam, 50.0f);
+            double phase = 0.0;
+            auto out = render(proc, 2.0, [&](double t2, int)
+            {
+                if (t2 >= 1.0)
+                    return 0.0f;
+                phase += 2.0 * juce::MathConstants<double>::pi * 220.0 / kSr;
+                return (float)(0.25 * std::sin(phase));
+            });
+            const double tailRms = regionRms(out, 1.2, 2.0);
+            rmsByType[t] = tailRms;
+            printf("  %-8s tail RMS %.4f, NaN %d\n",
+                   FamousBeatsVocalPresetsProcessor::kReverbTypeNames[t], tailRms, countNan(out));
+            char name[64];
+            std::snprintf(name, sizeof(name), "reverb %s produces a tail, no NaN",
+                          FamousBeatsVocalPresetsProcessor::kReverbTypeNames[t]);
+            check(tailRms > 0.001 && countNan(out) == 0, name);
+        }
+        double lo = rmsByType[0], hi = rmsByType[0];
+        for (int t = 1; t < 4; ++t)
+        {
+            lo = juce::jmin(lo, rmsByType[t]);
+            hi = juce::jmax(hi, rmsByType[t]);
+        }
+        printf("  tail RMS spread: %.4f .. %.4f\n", lo, hi);
+        check((hi - lo) / ((hi + lo) * 0.5) > 0.2, "reverb types decay differently");
+    }
+
+    // ---- Test 9: delay divisions --------------------------------------
+    {
+        printf("\nTest 9: tempo-synced delay divisions at 120 BPM\n");
+        const double expectedSecs[7] = { 1.0, 0.5, 0.25, 1.0 / 6.0, 0.125, 0.0625, 0.03125 };
+        FamousBeatsVocalPresetsProcessor proc;
+        proc.prepareToPlay(kSr, kBlock);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kDelaySyncParam, 1.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kDelayBpmParam, 120.0f);
+        for (int d = 0; d < 7; ++d)
+        {
+            setParam(proc, FamousBeatsVocalPresetsProcessor::kDelayDivisionParam, (float)d);
+            const double secs = proc.getDelayTimeSeconds();
+            printf("  %-5s -> %.4f s (expect %.4f s)\n",
+                   FamousBeatsVocalPresetsProcessor::kDelayDivisionNames[d], secs, expectedSecs[d]);
+            char name[64];
+            std::snprintf(name, sizeof(name), "division %s = %.0f ms at 120 BPM",
+                          FamousBeatsVocalPresetsProcessor::kDelayDivisionNames[d],
+                          expectedSecs[d] * 1000.0);
+            check(std::abs(secs - expectedSecs[d]) < 0.001, name);
+        }
+        // Sync off falls back to the ms control.
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kDelaySyncParam, 0.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kDelayTimeParam, 220.0f);
+        check(std::abs(proc.getDelayTimeSeconds() - 0.22) < 0.001,
+              "sync off uses the ms control (220 ms)");
+
+        // Functional check: an impulse echoes one division later.
+        {
+            FamousBeatsVocalPresetsProcessor proc2;
+            proc2.prepareToPlay(kSr, kBlock);
+            setChainFlat(proc2);
+            setParam(proc2, FamousBeatsVocalPresetsProcessor::kDelaySyncParam, 1.0f);
+            setParam(proc2, FamousBeatsVocalPresetsProcessor::kDelayDivisionParam, 1.0f); // 1/4 = 500 ms
+            setParam(proc2, FamousBeatsVocalPresetsProcessor::kDelayBpmParam, 120.0f);
+            setParam(proc2, FamousBeatsVocalPresetsProcessor::kDelayMixParam, 100.0f);
+            setParam(proc2, FamousBeatsVocalPresetsProcessor::kDelayFeedbackParam, 0.0f);
+            auto out = render(proc2, 1.5, [&](double t, int)
+            {
+                return (std::abs(t - 0.1) < 0.5 / kSr) ? 0.8f : 0.0f;
+            });
+            // The tuner dry-delay adds 2048 samples (~46 ms) even when
+            // the tune amount is 0, so the impulse lands at ~0.146 s
+            // and its echo at ~0.646 s.
+            const float echoPeak = regionPeak(out, 0.60, 0.70);
+            const float quietPeak = regionPeak(out, 0.25, 0.45);
+            printf("  impulse echo: peak %.2f in [0.60, 0.70] s, %.3f in [0.25, 0.45] s\n",
+                   echoPeak, quietPeak);
+            check(echoPeak > 0.3f, "echo arrives one division later");
+            check(quietPeak < 0.05f, "no echo where none is due");
+        }
+    }
+
+    // ---- Test 10: EQ curve math ---------------------------------------
+    {
+        printf("\nTest 10: EQ curve responds to parameters\n");
+        FamousBeatsVocalPresetsProcessor proc;
+        proc.prepareToPlay(kSr, kBlock);
+        setChainFlat(proc);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kEqAmountParam, 100.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kHpFreqParam, 90.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kMudGainParam, -6.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kMudFreqParam, 320.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kPresGainParam, 6.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kPresFreqParam, 4500.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kAirGainParam, 6.0f);
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kAirFreqParam, 10000.0f);
+
+        const float atPres = proc.getEqResponseDb(4500.0f);
+        const float atMud = proc.getEqResponseDb(320.0f);
+        const float atAir = proc.getEqResponseDb(10000.0f);
+        const float atAirHigh = proc.getEqResponseDb(18000.0f);
+        const float atLow = proc.getEqResponseDb(40.0f);
+        printf("  curve: 40 Hz %.1f dB, 320 Hz %.1f dB, 4.5 kHz %.1f dB, 10 kHz %.1f dB, 18 kHz %.1f dB\n",
+               atLow, atMud, atPres, atAir, atAirHigh);
+        check(atPres > 4.5f && atPres < 8.0f, "presence boost shows ~+6 dB at 4.5 kHz");
+        check(atMud > -7.5f && atMud < -4.5f, "mud cut shows ~-6 dB at 320 Hz");
+        // A +6 dB shelf is only ~half gain at its 10 kHz corner (measured
+        // 4.1 dB) and reaches full gain well above it (18 kHz).
+        check(atAir > 3.0f && atAir < 5.5f, "air shelf shows ~half gain at its 10 kHz corner");
+        check(atAirHigh > 5.0f && atAirHigh < 7.0f, "air shelf reaches ~+6 dB at 18 kHz");
+        check(atLow < -8.0f, "high-pass cuts hard at 40 Hz");
+
+        // Bulk curve matches the single-point values.
+        const float freqs[5] = { 40.0f, 320.0f, 4500.0f, 10000.0f, 18000.0f };
+        float dbs[5] = { 0, 0, 0, 0, 0 };
+        proc.getEqResponseCurve(freqs, dbs, 5);
+        check(std::abs(dbs[0] - atLow) < 0.01f && std::abs(dbs[1] - atMud) < 0.01f
+              && std::abs(dbs[2] - atPres) < 0.01f && std::abs(dbs[3] - atAir) < 0.01f
+              && std::abs(dbs[4] - atAirHigh) < 0.01f,
+              "bulk curve matches single-point values");
+
+        // The curve moves when a parameter moves.
+        setParam(proc, FamousBeatsVocalPresetsProcessor::kPresGainParam, 0.0f);
+        const float atPresFlat = proc.getEqResponseDb(4500.0f);
+        printf("  presence to 0 dB: 4.5 kHz now %.1f dB\n", atPresFlat);
+        check(std::abs(atPresFlat) < 1.5f, "curve follows the presence gain");
+    }
+
+    // ---- CPU profile: where the CPU goes -------------------------------
+    // Single 10 s pass per configuration, Travis Scott preset. Shows
+    // what the per-section bypass actually saves.
+    {
+        printf("\nCPU profile: 10 s vocal-like audio, single pass each\n");
+        auto benchOne = [&](const char* label,
+                            const std::function<void(FamousBeatsVocalPresetsProcessor&)>& setup)
+        {
+            FamousBeatsVocalPresetsProcessor proc;
+            proc.prepareToPlay(kSr, kBlock);
+            proc.applyPreset(1); // Travis Scott
+            setup(proc);
+            double phase = 0.0;
+            const auto t0 = std::chrono::steady_clock::now();
+            auto out = render(proc, 10.0, [&](double t, int)
+            {
+                const double f0 = 220.0 * std::pow(2.0, (0.5 / 12.0) * std::sin(2.0 * juce::MathConstants<double>::pi * 5.0 * t));
+                phase += 2.0 * juce::MathConstants<double>::pi * f0 / kSr;
+                double s = 0.0;
+                for (int k = 1; k <= 6; ++k)
+                    s += (1.0 / k) * std::sin(k * phase);
+                return (float)(0.25 * s);
+            });
+            const auto t1 = std::chrono::steady_clock::now();
+            const double pct = std::chrono::duration<double>(t1 - t0).count() / 10.0 * 100.0;
+            printf("  %-32s %.1f%% of one core\n", label, pct);
+            (void)out;
+        };
+        benchOne("Travis Scott (full)", [](FamousBeatsVocalPresetsProcessor&) {});
+        benchOne("Travis Scott, Tune 0", [](FamousBeatsVocalPresetsProcessor& p)
+        {
+            setParam(p, FamousBeatsVocalPresetsProcessor::kTuneAmountParam, 0.0f);
+        });
+        benchOne("Travis Scott, Clean 0", [](FamousBeatsVocalPresetsProcessor& p)
+        {
+            setParam(p, FamousBeatsVocalPresetsProcessor::kCleanAmountParam, 0.0f);
+        });
+        benchOne("Travis Scott, Verb+Delay 0", [](FamousBeatsVocalPresetsProcessor& p)
+        {
+            setParam(p, FamousBeatsVocalPresetsProcessor::kReverbMixParam, 0.0f);
+            setParam(p, FamousBeatsVocalPresetsProcessor::kDelayMixParam, 0.0f);
+        });
+        benchOne("Travis Scott, Preamp 0", [](FamousBeatsVocalPresetsProcessor& p)
+        {
+            setParam(p, FamousBeatsVocalPresetsProcessor::kPreampGainParam, 0.0f);
+            setParam(p, FamousBeatsVocalPresetsProcessor::kPreampDriveParam, 0.0f);
+            setParam(p, FamousBeatsVocalPresetsProcessor::kPreampAirParam, 0.0f);
+        });
     }
 
     printf("\n%s: %d failure(s)\n", failures == 0 ? "ALL TESTS PASSED" : "FAILURES", failures);
