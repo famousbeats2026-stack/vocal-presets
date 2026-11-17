@@ -75,34 +75,59 @@ and a password.
 
 - Put it on a **vocal track** — one instance per vocal. It is a vocal
   chain, not a mix-bus plugin: don't put it on a finished mix.
-- **Pick a preset first** — Drake, Travis Scott, Don Toliver, or Clean /
-  Radio. That sets the whole chain at once. Then turn any knob to taste.
+- **Pick a preset first** — Drake, Travis Scott, Don Toliver, Clean /
+  Radio, or Rap Singing. That sets the whole chain at once. Then turn
+  any knob to taste.
 - **Key / Scale** (in the Tune section) tells the pitch corrector what
   key your song is in. Default is C major. Set it to your song's key or
   the tuner will pull notes to the wrong scale.
 - **Tune Amount** — how hard the correction pulls. 100% with a fast
   Retune Speed is the hard-tune Travis Scott sound; lower amounts with
   a slow speed are transparent.
+- **EQ curve** — the gold curve at the top shows the EQ as it really
+  is. Drag a node left/right to move its frequency, up/down to change
+  its gain. HP moves in frequency only.
+- **Preamp** — the first thing your vocal hits. Gain and Drive warm it
+  up like a tube channel strip; the **AIR** button opens the top end
+  with a high air boost.
+- **Delay Sync** — turn Sync on and pick a note division (1/2, 1/4,
+  1/8, 1/12, 1/16, 1/32, 1/64) and the delay follows your song's tempo
+  (from the DAW, or the BPM knob when the DAW gives no tempo). Turn it
+  off to set the time in ms.
+- **Reverb Type** — Hall, Plate, Room, or Chamber. Hall is big and
+  lush, Plate is bright and dense, Room is small and tight, Chamber is
+  warm and medium-large.
 - Use it on **dry vocals**. The cleaner can't tell music from noise,
   so don't put it on a vocal with music behind it.
 - It adds about 45 ms of latency (noise cleaner + pitch shifter), but
   your DAW compensates for that automatically, so the vocal stays in
   time. It is a mixing plugin — don't track live through it.
+- **CPU** — sections you turn down to zero are skipped entirely, so
+  turning Tune or the cleaner off frees real CPU. If it still feels
+  heavy, turn the Tune Amount down first: the pitch shifter is the
+  hungriest part of the chain.
 
 ## The chain (in order)
 
-1. **Vocal Cleaner** — RNNoise neural denoiser (the tech behind
+1. **Preamp (Avalon-style)** — warm tube-style gain stage with Gain
+   and Drive, plus the **AIR** button: a high air boost that opens the
+   top end. (Avalon-style character — it is not the actual Avalon
+   VT-737SP hardware.)
+2. **Vocal Cleaner** — RNNoise neural denoiser (the tech behind
    Discord/Zoom voice cleanup). Removes room tone, fan, hum and hiss.
-2. **EQ** — industry-standard vocal curve: high-pass (~85 Hz), mud cut
-   (~300 Hz), presence boost (~4 kHz), air boost (~11 kHz).
-3. **Compressor** — smooths the dynamics so the vocal sits steady.
-4. **Saturation** — tanh warmth/grit. A little adds body; a lot adds
+3. **EQ** — industry-standard vocal curve: high-pass (~85 Hz), mud cut
+   (~300 Hz), presence boost (~4 kHz), air boost (~11 kHz). The curve
+   at the top of the window shows it and is draggable.
+4. **Compressor** — smooths the dynamics so the vocal sits steady.
+   Threshold, Ratio, Attack, Release and Mix are all on the panel.
+5. **Saturation** — tanh warmth/grit. A little adds body; a lot adds
    edge.
-5. **Tune** — pitch correction. Detects the sung pitch and snaps it to
+6. **Tune** — pitch correction. Detects the sung pitch and snaps it to
    the nearest note of your key/scale. See the honesty note below.
-6. **Reverb** — room/plate space.
-7. **Delay** — stereo delay with darkened repeats, for slap and throws.
-8. **Output gain**.
+7. **Reverb** — Hall, Plate, Room, or Chamber space.
+8. **Delay** — stereo delay with darkened repeats, for slap and throws.
+   Tempo-synced note divisions or plain ms.
+9. **Output gain**.
 
 ## The presets
 
@@ -114,6 +139,9 @@ and a password.
 - **Don Toliver** — melodic and airy. Medium tune, bright airy EQ,
   medium reverb, warm delay.
 - **Clean / Radio** — polished modern radio vocal. Balanced full chain.
+- **Rap Singing** — punchy and upfront for melodic rap and sung rap.
+  Tight fast compression, light natural tune, small tight room reverb,
+  and a tempo-synced 1/8 delay, with the preamp and AIR on.
 
 ## About the tuner — please read
 
@@ -140,18 +168,31 @@ fine-tune problem notes in your DAW's pitch editor afterwards.
   your session's sample rate, so it works at 44.1 kHz, 48 kHz,
   96 kHz, and anything else your DAW uses. Stereo: one denoiser
   per channel.
-- Pitch detection by normalised autocorrelation (65–1050 Hz); pitch
-  shifting by a phase vocoder (2048-point STFT, hop 512); ratio
-  slewed by the Retune Speed control; correction gated off on
-  silence, noise, and low-confidence detection so it never chases
-  room tone. The vocoder adds one FFT frame (2048 samples) of
-  latency, which the host compensates.
-- Tested on Linux before shipping (all 6 chain tests pass): steady
-  white noise at -20 dBFS dropped to -60.9 dBFS (40.9 dB reduction);
-  an off-pitch 228 Hz test note was pulled to 219.4 Hz, 5 cents off
+- Pitch detection by normalised autocorrelation (65–1050 Hz), now
+  running every 2048 samples; pitch shifting by a phase vocoder
+  (2048-point STFT, hop 1024, 50% overlap, with Laroche phase locking
+  so the shift stays accurate at the wider hop); ratio slewed by the
+  Retune Speed control; correction gated off on silence, noise, and
+  low-confidence detection so it never chases room tone. The vocoder
+  adds one FFT frame (2048 samples) of latency, which the host
+  compensates. When Tune Amount is 0 the vocoder is skipped entirely
+  (only a cheap delay line keeps the timing true), and every section
+  whose amount is 0 is skipped the same way — that is most of the CPU
+  saving. Full chain (Travis Scott preset, the heaviest) measured
+  15.5% of one core on the build machine, down from 22.1% before
+  these optimisations; with Tune off it drops to 8.4%.
+- The EQ knobs are smoothed over 50 ms per block (a pre-existing bug
+  had the smoothers advancing one sample-step per block, so the EQ
+  took ~25 s to respond to a knob turn — fixed).
+- Tested on Linux before shipping (all chain tests pass): steady
+  white noise at -20 dBFS dropped to about -60 dBFS (roughly 40 dB
+  reduction — 39.5 to 40.9 dB across runs, the test noise is random);
+  an off-pitch 228 Hz test note was pulled to 220.5 Hz, 4 cents off
   A3 (220 Hz); silence stays silent; a two-note chord does not crash
-  or clip; all four presets run clean with no NaN and peaks at or
-  below 1.0. Real results depend on the recording.
+  or clip; all five presets run clean with no NaN and peaks at or
+  below 1.0; the preamp, Air button, reverb types, delay divisions
+  and EQ curve are all covered by tests. Real results depend on the
+  recording.
 
 ## Files in this project
 
